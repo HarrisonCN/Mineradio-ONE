@@ -52,10 +52,14 @@ const crypto = require('crypto');
 const tls = require('tls');
 const { once } = require('events');
 const { fileURLToPath } = require('url');
+const { Readable, pipeline } = require('stream');
 const { analyzePodcastDjStream, analyzePodcastDjIntro } = require('./dj-analyzer');
 
 const PORT = process.env.PORT || 3000;
-const HOST = process.env.HOST || '0.0.0.0';
+// 默认只监听本机回环地址：本地 API 持有登录 Cookie，不应暴露给局域网。
+// 需要局域网访问时显式设置 HOST=0.0.0.0。
+const HOST = process.env.HOST || '127.0.0.1';
+const LOOPBACK_HOSTNAMES = new Set(['127.0.0.1', 'localhost', '::1', '[::1]']);
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 const COOKIE_FILE = process.env.COOKIE_FILE || path.join(__dirname, '.cookie');
 const QQ_COOKIE_FILE = process.env.QQ_COOKIE_FILE || path.join(__dirname, '.qq-cookie');
@@ -111,13 +115,22 @@ applySystemCertificateAuthorities();
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
-  '.js':   'application/javascript',
-  '.css':  'text/css',
-  '.json': 'application/json',
+  '.js':   'application/javascript; charset=utf-8',
+  '.css':  'text/css; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
   '.png':  'image/png',
   '.jpg':  'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.gif':  'image/gif',
+  '.webp': 'image/webp',
   '.ico':  'image/x-icon',
   '.svg':  'image/svg+xml',
+  '.bin':  'application/octet-stream',
+  '.wasm': 'application/wasm',
+  '.mp4':  'video/mp4',
+  '.webm': 'video/webm',
+  '.woff2': 'font/woff2',
+  '.txt':  'text/plain; charset=utf-8',
 };
 
 // ---------- Cookie 持久化 ----------
@@ -207,7 +220,6 @@ function serveStatic(res, filePath) {
 function sendJSON(res, data, status) {
   res.writeHead(status || 200, {
     'Content-Type': 'application/json; charset=utf-8',
-    'Access-Control-Allow-Origin': '*',
     'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate',
     'Pragma': 'no-cache',
     'Expires': '0',
@@ -1380,24 +1392,42 @@ function startUpdatePatchJob(info) {
   downloadAndApplyPatchWithMirrors(job);
   return publicUpdateJob(job);
 }
-function readRequestBody(req) {
+function readRequestBody(req, limit = 8 * 1024 * 1024) {
   return new Promise(resolve => {
-    let raw = '';
+    // 以 Buffer 收集后再统一解码：逐块拼接字符串会把跨块的中文等多字节 UTF-8 字符切坏。
+    const chunks = [];
+    let size = 0;
+    let settled = false;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      resolve(value);
+    };
     req.on('data', chunk => {
-      raw += chunk;
-      if (raw.length > 8 * 1024 * 1024) req.destroy();
+      if (settled) return;
+      size += chunk.length;
+      if (size > limit) {
+        // 超限时直接结束；原实现 destroy 后不会再触发 end，Promise 永远挂起。
+        finish({});
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
     });
     req.on('end', () => {
-      if (!raw) { resolve({}); return; }
-      try { resolve(JSON.parse(raw)); }
+      if (settled) return;
+      const raw = Buffer.concat(chunks).toString('utf8');
+      if (!raw) { finish({}); return; }
+      try { finish(JSON.parse(raw)); }
       catch (e) {
         const params = new URLSearchParams(raw);
         const out = {};
         params.forEach((v, k) => { out[k] = v; });
-        resolve(out);
+        finish(out);
       }
     });
-    req.on('error', () => resolve({}));
+    req.on('error', () => finish({}));
+    req.on('close', () => finish({}));
   });
 }
 function normalizeApiCode(payload) {
@@ -3892,9 +3922,62 @@ async function getLoginInfo() {
 // ====================================================================
 //  HTTP Server
 // ====================================================================
-const server = http.createServer(async (req, res) => {
+// ---------- 请求来源校验 ----------
+// 本地 API 能读写用户的网易云/QQ/酷狗登录态。浏览器里任意网页都能向 127.0.0.1:端口 发请求，
+// 所以 /api/* 只接受同源请求，拒绝跨站请求（CSRF）和 DNS rebinding。
+function requestHostname(hostHeader) {
+  try { return new URL('http://' + String(hostHeader || '')).hostname.toLowerCase(); }
+  catch (e) { return ''; }
+}
+function isTrustedApiRequest(req) {
+  const hostHeader = String(req.headers.host || '').toLowerCase();
+  if (LOOPBACK_HOSTNAMES.has(String(HOST).toLowerCase()) && !LOOPBACK_HOSTNAMES.has(requestHostname(hostHeader))) {
+    return false;
+  }
+  const fetchSite = String(req.headers['sec-fetch-site'] || '').toLowerCase();
+  if (fetchSite === 'cross-site') return false;
+  const origin = req.headers.origin;
+  if (origin) {
+    try {
+      if (new URL(origin).host.toLowerCase() !== hostHeader) return false;
+    } catch (e) {
+      return false; // 包括 Origin: null
+    }
+  }
+  return true;
+}
+
+// 把上游 fetch 的 body 流式转发给客户端：遵守背压，客户端断开（切歌/拖动进度）时立刻取消上游下载。
+function pipeUpstreamBody(upstream, res) {
+  return new Promise(resolve => {
+    if (!upstream || !upstream.body) { res.end(); resolve(); return; }
+    pipeline(Readable.fromWeb(upstream.body), res, (err) => {
+      if (err && err.code !== 'ERR_STREAM_PREMATURE_CLOSE' && err.name !== 'AbortError') {
+        console.warn('[Proxy] stream aborted:', err.message);
+      }
+      resolve();
+    });
+  });
+}
+function abortOnClientClose(res) {
+  const controller = new AbortController();
+  res.on('close', () => { if (!res.writableFinished) controller.abort(); });
+  return controller;
+}
+function failProxyResponse(res) {
+  if (res.headersSent) { res.destroy(); return; }
+  res.writeHead(500);
+  res.end();
+}
+
+async function handleRequest(req, res) {
   const url = new URL(req.url, 'http://localhost:' + PORT);
   const pn = url.pathname;
+
+  if (pn.startsWith('/api/') && !isTrustedApiRequest(req)) {
+    sendJSON(res, { ok: false, error: 'FORBIDDEN_ORIGIN' }, 403);
+    return;
+  }
 
   if (pn === '/api/app/version') {
     sendJSON(res, {
@@ -4915,25 +4998,26 @@ const server = http.createServer(async (req, res) => {
       const coverUrl = url.searchParams.get('url');
       // URL 校验: 必须是 http(s) 开头, 否则直接 404 (不要让 fetch 抛错)
       if (!coverUrl || !/^https?:\/\//i.test(coverUrl)) {
-        res.writeHead(400, { 'Access-Control-Allow-Origin': '*' });
+        res.writeHead(400);
         res.end('Invalid cover url');
         return;
       }
-      const resp = await fetch(coverUrl, { headers: { 'User-Agent': UA, 'Referer': 'https://music.163.com/' } });
+      const controller = abortOnClientClose(res);
+      const resp = await fetch(coverUrl, { headers: { 'User-Agent': UA, 'Referer': 'https://music.163.com/' }, signal: controller.signal });
       const ct  = resp.headers.get('content-type') || 'image/jpeg';
       const cl  = resp.headers.get('content-length');
       const hdr = {
         'Content-Type': ct,
-        'Access-Control-Allow-Origin': '*',
         'Cross-Origin-Resource-Policy': 'cross-origin',
         'Cache-Control': 'public, max-age=86400',
       };
       if (cl) hdr['Content-Length'] = cl;
       res.writeHead(resp.status, hdr);
-      const reader = resp.body.getReader();
-      while (true) { const c = await reader.read(); if (c.done) break; res.write(c.value); }
-      res.end();
-    } catch (err) { console.error('[Cover]', err); res.writeHead(500); res.end(); }
+      await pipeUpstreamBody(resp, res);
+    } catch (err) {
+      if (err && err.name !== 'AbortError') console.error('[Cover]', err);
+      failProxyResponse(res);
+    }
     return;
   }
 
@@ -4941,22 +5025,23 @@ const server = http.createServer(async (req, res) => {
   if (pn === '/api/audio') {
     try {
       const audioUrl = url.searchParams.get('url');
-      if (!audioUrl) { res.writeHead(400); res.end('Missing url'); return; }
+      if (!audioUrl || !/^https?:\/\//i.test(audioUrl)) { res.writeHead(400); res.end('Invalid audio url'); return; }
       const range = req.headers.range || '';
       const hdr = audioProxyHeadersFor(audioUrl, range);
-      const up = await fetch(audioUrl, { headers: hdr });
+      const controller = abortOnClientClose(res);
+      const up = await fetch(audioUrl, { headers: hdr, signal: controller.signal });
       const out = {
         'Content-Type': audioContentTypeForUrl(audioUrl, up.headers.get('content-type')),
-        'Access-Control-Allow-Origin': '*',
         'Accept-Ranges': 'bytes',
       };
       const cl = up.headers.get('content-length'); if (cl) out['Content-Length'] = cl;
       const cr = up.headers.get('content-range');  if (cr) out['Content-Range']  = cr;
       res.writeHead(up.status, out);
-      const reader = up.body.getReader();
-      while (true) { const c = await reader.read(); if (c.done) break; res.write(c.value); }
-      res.end();
-    } catch (err) { console.error('[Audio]', err); res.writeHead(500); res.end(); }
+      await pipeUpstreamBody(up, res);
+    } catch (err) {
+      if (err && err.name !== 'AbortError') console.error('[Audio]', err);
+      failProxyResponse(res);
+    }
     return;
   }
 
@@ -4966,9 +5051,24 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  let filePath = pn === '/' ? '/index.html' : pn;
-  filePath = path.join(__dirname, 'public', filePath);
+  let relPath = pn === '/' ? '/index.html' : pn;
+  try { relPath = decodeURIComponent(relPath); }
+  catch (e) { res.writeHead(400); res.end('Bad Request'); return; }
+  const publicRoot = path.join(__dirname, 'public');
+  const filePath = path.resolve(publicRoot, '.' + relPath);
+  if (relPath.includes('\0') || !filePath.startsWith(publicRoot + path.sep)) {
+    res.writeHead(404); res.end('Not Found'); return;
+  }
   serveStatic(res, filePath);
+}
+
+const server = http.createServer((req, res) => {
+  handleRequest(req, res).catch(err => {
+    console.error('[Server]', err);
+    if (res.headersSent) { res.destroy(); return; }
+    try { sendJSON(res, { ok: false, error: (err && err.message) || 'INTERNAL_ERROR' }, 500); }
+    catch (_) { res.destroy(); }
+  });
 });
 
 server.listen(PORT, HOST, () => {

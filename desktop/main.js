@@ -114,6 +114,29 @@ function findOpenPort(startPort) {
   });
 }
 
+// 只把 http/https/mailto 交给系统打开，避免 file:、自定义协议等被网页内容触发。
+const SAFE_EXTERNAL_PROTOCOLS = new Set(['http:', 'https:', 'mailto:']);
+function openExternalSafe(url) {
+  try {
+    const parsed = new URL(String(url || ''));
+    if (!SAFE_EXTERNAL_PROTOCOLS.has(parsed.protocol)) return false;
+    shell.openExternal(parsed.href).catch(() => {});
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+function isLocalAppUrl(url) {
+  try {
+    const parsed = new URL(String(url || ''));
+    const port = String(mainServerPort || process.env.PORT || 3000);
+    return parsed.protocol === 'http:' && parsed.hostname === '127.0.0.1' && parsed.port === port;
+  } catch (e) {
+    return false;
+  }
+}
+
 function waitForServer(server) {
   if (!server || server.listening) return Promise.resolve();
 
@@ -448,10 +471,10 @@ async function openNeteaseMusicLoginWindow(owner) {
     };
 
     loginWindow.webContents.setWindowOpenHandler(({ url }) => {
-      if (/^https?:\/\/([^/]+\.)?(163|music\.163|netease)\.com/i.test(url)) {
+      if (/^https?:\/\/([^/?#]+\.)?(163|music\.163|netease)\.com(?=[:/?#]|$)/i.test(url)) {
         loginWindow.loadURL(url).catch((e) => console.warn('Netease login popup navigation failed:', e.message));
-      } else if (/^https?:\/\//i.test(url)) {
-        shell.openExternal(url).catch(() => {});
+      } else {
+        openExternalSafe(url);
       }
       return { action: 'deny' };
     });
@@ -560,7 +583,7 @@ async function openQQMusicLoginWindow(owner) {
       if (/^https?:\/\//i.test(url)) {
         loginWindow.loadURL(url).catch((e) => console.warn('QQ login popup navigation failed:', e.message));
       } else {
-        shell.openExternal(url).catch(() => {});
+        openExternalSafe(url);
       }
       return { action: 'deny' };
     });
@@ -1320,13 +1343,16 @@ ipcMain.handle('mineradio-wallpaper-update', async (_event, payload) => {
 async function createWindow() {
   htmlFullscreenActive = false;
   windowFullscreenActive = false;
-  const port = await findOpenPort(3000);
+  // 重新创建窗口（如 macOS activate / second-instance）时复用已在监听的本地服务端口：
+  // server.js 被 require 缓存，不会在新端口上再次 listen，重新找端口会让窗口加载到空端口。
+  const port = (localServer && localServer.listening && mainServerPort) ? mainServerPort : await findOpenPort(3000);
   mainServerPort = port;
 
   process.env.HOST = '127.0.0.1';
   process.env.PORT = String(port);
   process.env.COOKIE_FILE = path.join(app.getPath('userData'), '.cookie');
   process.env.QQ_COOKIE_FILE = path.join(app.getPath('userData'), '.qq-cookie');
+  process.env.KUGOU_COOKIE_FILE = path.join(app.getPath('userData'), '.kugou-cookie');
   process.env.MINERADIO_UPDATE_DIR = getUpdateDownloadDir();
   try {
     const legacyQQCookie = path.join(__dirname, '..', '.qq-cookie');
@@ -1338,6 +1364,17 @@ async function createWindow() {
     }
   } catch (e) {
     console.warn('QQ cookie migration skipped:', e.message);
+  }
+  try {
+    const legacyKugouCookie = path.join(__dirname, '..', '.kugou-cookie');
+    if (fs.existsSync(legacyKugouCookie)) {
+      if (!fs.existsSync(process.env.KUGOU_COOKIE_FILE)) {
+        fs.copyFileSync(legacyKugouCookie, process.env.KUGOU_COOKIE_FILE);
+      }
+      fs.unlinkSync(legacyKugouCookie);
+    }
+  } catch (e) {
+    console.warn('Kugou cookie migration skipped:', e.message);
   }
 
   localServer = require(path.join(__dirname, '..', 'server.js'));
@@ -1368,8 +1405,15 @@ async function createWindow() {
   });
 
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    shell.openExternal(url);
+    openExternalSafe(url);
     return { action: 'deny' };
+  });
+
+  // 主窗口带有 preload 暴露的桌面 API，禁止它被导航到本地服务以外的页面。
+  mainWindow.webContents.on('will-navigate', (event, url) => {
+    if (isLocalAppUrl(url)) return;
+    event.preventDefault();
+    openExternalSafe(url);
   });
 
   mainWindow.webContents.once('did-finish-load', () => {
