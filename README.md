@@ -75,6 +75,37 @@ npm run build:win
 
 桌面版入口由 Electron 主进程加载本地服务。`npm run build:win` 会生成 Windows NSIS 安装包，产物位于 `dist/`。
 
+也可以不启动 Electron，单独运行本地服务并用浏览器打开 `http://127.0.0.1:3000`：
+
+```bash
+node server.js
+```
+
+常用环境变量：
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `PORT` | `3000` | 本地服务端口（桌面版会自动寻找可用端口） |
+| `HOST` | `127.0.0.1` | 监听地址。默认只允许本机访问；确实需要局域网访问时再设为 `0.0.0.0` |
+| `COOKIE_FILE` / `QQ_COOKIE_FILE` / `KUGOU_COOKIE_FILE` | 项目目录下的 `.cookie` 等 | 登录态保存位置（桌面版统一放在系统用户数据目录） |
+| `MINERADIO_UPDATE_MANIFEST` | 空 | 本地模拟更新 manifest，见下方「更新机制」 |
+
+提交前至少运行：
+
+```bash
+git diff --check
+node --check server.js
+node --check desktop/main.js
+```
+
+### 本地服务安全模型
+
+本地服务持有网易云 / QQ 音乐 / 酷狗的登录 Cookie，因此：
+
+- 默认只监听 `127.0.0.1`，不暴露给局域网。
+- `/api/*` 只接受同源请求：带有跨站 `Origin` / `Sec-Fetch-Site: cross-site` 的请求，以及 `Host` 不是本机地址的请求（DNS rebinding）会返回 `403 FORBIDDEN_ORIGIN`。普通网页无法再读取歌单、改写登录态或触发更新。
+- 不再返回 `Access-Control-Allow-Origin: *`。所有页面（主界面、桌面歌词、壁纸）都由同一个本地服务提供，属于同源访问，不受影响。
+
 ## 更新机制
 
 Mineradio 会请求 GitHub Releases latest 检测新版本。远端版本高于本地版本时，应用内更新入口会展示 Release 内容、下载安装包到本机用户数据目录，并通过系统打开安装包。
